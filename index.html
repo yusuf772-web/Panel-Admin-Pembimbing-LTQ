@@ -112,6 +112,13 @@
         .rekap-table .holiday-cell {
             background-color: #7f1d1d; /* bg-red-900 */
         }
+        .attendance-cell {
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+        .attendance-cell:not(.holiday-cell):hover {
+            background-color: #4b5563; /* bg-gray-600 */
+        }
     </style>
 </head>
 <body class="p-4 sm:p-6 lg:p-8">
@@ -232,7 +239,7 @@
         // --- Firebase SDK Imports ---
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, collection, onSnapshot, query, where, doc, setDoc, addDoc, deleteDoc, getDoc, getDocs } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { getFirestore, collection, onSnapshot, query, where, doc, setDoc, addDoc, deleteDoc, getDoc, getDocs, updateDoc, arrayUnion, arrayRemove } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         // --- Firebase Configuration ---
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
@@ -276,7 +283,6 @@
             holidaysListContainer: document.getElementById('holidaysListContainer'),
             addHolidayBtn: document.getElementById('addHolidayBtn'),
             saveHolidaysBtn: document.getElementById('saveHolidaysBtn'),
-            // Recap Elements
             rekapContainer: document.getElementById('rekapContainer'),
             rekapTitle: document.getElementById('rekapTitle'),
             rekapLoader: document.getElementById('rekapLoader'),
@@ -303,20 +309,20 @@
             unsubscribes.periods = onSnapshot(periodsCollection, (snapshot) => {
                 allPeriods = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
                 renderPeriodsList();
-                findAndRenderActivePeriodRekap(); // Check for rekap after periods load
+                findAndRenderActivePeriodRekap();
             });
 
             const holidayDocRef = doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'holidays');
             unsubscribes.holidays = onSnapshot(holidayDocRef, (docSnap) => {
                 allHolidays = docSnap.exists() ? docSnap.data().dates || [] : [];
                 renderHolidaysList();
-                if (activePeriod) showRekapForPeriod(activePeriod); // Re-render rekap if holidays change
+                if (activePeriod) showRekapForPeriod(activePeriod);
             });
             
             const mentorsCollection = collection(db, 'artifacts', appId, 'public', 'data', 'mentors');
             unsubscribes.mentors = onSnapshot(mentorsCollection, (snapshot) => {
                 allMentors = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-                if (activePeriod) showRekapForPeriod(activePeriod); // Re-render rekap if mentors change
+                if (activePeriod) showRekapForPeriod(activePeriod);
             });
         }
 
@@ -451,7 +457,6 @@
 
             try {
                 const holidayDocRef = doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'holidays');
-                // To save, we need to merge with existing holidays from other months
                 const otherHolidays = allHolidays.filter(h => {
                     const hDate = new Date(h.date + 'T00:00:00');
                     return !(hDate.getMonth() === parseInt(dom.monthFilter.value, 10) && hDate.getFullYear() === parseInt(dom.yearFilter.value, 10));
@@ -481,7 +486,7 @@
                 activePeriod = null;
                 dom.rekapLoader.innerHTML = `Tidak ada periode rekap yang cocok untuk <b>${getMonthName(selectedMonth)} ${selectedYear}</b>. Silakan buat periode terlebih dahulu.`;
                 dom.rekapTableWrapper.innerHTML = '';
-                dom.exportBtn.classList.add('hidden'); // Hide export button if no data
+                dom.exportBtn.classList.add('hidden');
             }
         }
 
@@ -501,21 +506,26 @@
                     where('date', '>=', period.startDate), 
                     where('date', '<=', period.endDate)
                 );
-                const attendanceSnapshot = await getDocs(q);
+                
+                // Set up a real-time listener for attendance data
+                if (unsubscribes.attendance) unsubscribes.attendance(); // Unsubscribe from previous listener
+                
+                unsubscribes.attendance = onSnapshot(q, (attendanceSnapshot) => {
+                    const attendanceData = new Map();
+                    attendanceSnapshot.forEach(docSnap => {
+                        const data = docSnap.data();
+                        attendanceData.set(`${data.date}_${data.session}`, new Set(data.presentMentors));
+                    });
 
-                const attendanceData = new Map();
-                attendanceSnapshot.forEach(docSnap => {
-                    const data = docSnap.data();
-                    attendanceData.set(`${data.date}_${data.session}`, new Set(data.presentMentors));
+                    const holidaysForPeriod = allHolidays.filter(h => h.date >= period.startDate && h.date <= period.endDate);
+                    renderRekapTable(period, attendanceData, holidaysForPeriod);
+                    dom.exportBtn.classList.remove('hidden');
+                    dom.rekapLoader.classList.add('hidden');
                 });
 
-                const holidaysForPeriod = allHolidays.filter(h => h.date >= period.startDate && h.date <= period.endDate);
-                renderRekapTable(period, attendanceData, holidaysForPeriod);
-                dom.exportBtn.classList.remove('hidden'); // Show export button
             } catch (error) {
                 showToast("Gagal menampilkan rekap.", true);
                 dom.exportBtn.classList.add('hidden');
-            } finally {
                 dom.rekapLoader.classList.add('hidden');
             }
         }
@@ -556,33 +566,24 @@
                     const dateString = toLocalDateString(date);
                     
                     const isHolidayPagi = holidays.some(h => h.date === dateString && (h.time === "Pagi" || h.time === "Pagi & Sore"));
-                    if (!isHolidayPagi) {
-                        possiblePagi++;
-                    }
-                    const pagiCellClass = isHolidayPagi ? 'holiday-cell' : '';
-                    if (attendanceData.get(`${dateString}_pagi`)?.has(mentor.name)) {
-                        pagiDateCellsHTML += `<td class="${pagiCellClass}"><i data-lucide="check" class="w-4 h-4 mx-auto text-green-400"></i></td>`;
-                        totalPagi++;
-                    } else {
-                        pagiDateCellsHTML += `<td class="${pagiCellClass}"></td>`;
-                    }
+                    if (!isHolidayPagi) possiblePagi++;
+                    const isPresentPagi = attendanceData.get(`${dateString}_pagi`)?.has(mentor.name);
+                    if (isPresentPagi) totalPagi++;
+                    pagiDateCellsHTML += `<td class="attendance-cell ${isHolidayPagi ? 'holiday-cell' : ''}" data-date="${dateString}" data-session="pagi" data-mentor-name="${mentor.name}" data-present="${!!isPresentPagi}">
+                        ${isPresentPagi ? '<i data-lucide="check" class="w-4 h-4 mx-auto text-green-400 pointer-events-none"></i>' : ''}
+                    </td>`;
 
                     const isHolidaySore = holidays.some(h => h.date === dateString && (h.time === "Sore" || h.time === "Pagi & Sore"));
-                    if (!isHolidaySore) {
-                        possibleSore++;
-                    }
-                    const soreCellClass = isHolidaySore ? 'holiday-cell' : '';
-                    if (attendanceData.get(`${dateString}_sore`)?.has(mentor.name)) {
-                        soreDateCellsHTML += `<td class="${soreCellClass}"><i data-lucide="check" class="w-4 h-4 mx-auto text-green-400"></i></td>`;
-                        totalSore++;
-                    } else {
-                        soreDateCellsHTML += `<td class="${soreCellClass}"></td>`;
-                    }
+                    if (!isHolidaySore) possibleSore++;
+                    const isPresentSore = attendanceData.get(`${dateString}_sore`)?.has(mentor.name);
+                    if (isPresentSore) totalSore++;
+                    soreDateCellsHTML += `<td class="attendance-cell ${isHolidaySore ? 'holiday-cell' : ''}" data-date="${dateString}" data-session="sore" data-mentor-name="${mentor.name}" data-present="${!!isPresentSore}">
+                        ${isPresentSore ? '<i data-lucide="check" class="w-4 h-4 mx-auto text-green-400 pointer-events-none"></i>' : ''}
+                    </td>`;
                 });
 
                 const finalTotalAttendance = totalPagi + totalSore;
                 const totalPossible = possiblePagi + possibleSore;
-                // Changed: Use .toFixed(0) for whole number percentage
                 const finalPercentage = totalPossible > 0 ? ((finalTotalAttendance / totalPossible) * 100).toFixed(0) : '0';
 
                 tableHTML += `<tr><td class="mentor-name" rowspan="2">${mentor.name}</td><td class="waktu">Pagi</td>${pagiDateCellsHTML}<td class="font-semibold">${totalPagi}</td><td class="font-semibold" rowspan="2">${finalPercentage}%</td></tr>`;
@@ -592,6 +593,38 @@
             tableHTML += `</tbody></table>`;
             dom.rekapTableWrapper.innerHTML = tableHTML;
             lucide.createIcons();
+        }
+
+        async function handleAttendanceToggle(e) {
+            const cell = e.target.closest('.attendance-cell');
+            if (!cell || cell.classList.contains('holiday-cell')) return;
+
+            const { date, session, mentorName, present } = cell.dataset;
+            const isPresent = present === 'true';
+
+            cell.innerHTML = '<div class="w-4 h-4 border-2 border-gray-400 border-t-transparent rounded-full animate-spin mx-auto"></div>'; // Loading spinner
+
+            const docId = `${date}_${session}`;
+            const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'dailyAttendance', docId);
+
+            try {
+                if (isPresent) {
+                    await updateDoc(docRef, { presentMentors: arrayRemove(mentorName) });
+                } else {
+                    const docSnap = await getDoc(docRef);
+                    if (docSnap.exists()) {
+                        await updateDoc(docRef, { presentMentors: arrayUnion(mentorName) });
+                    } else {
+                        await setDoc(docRef, { date, session, presentMentors: [mentorName] });
+                    }
+                }
+                // The onSnapshot listener will automatically re-render the table, no need to show toast here.
+            } catch (error) {
+                console.error("Error updating attendance:", error);
+                showToast("Gagal memperbarui kehadiran.", true);
+                // Re-render to revert the loading spinner on error
+                if (activePeriod) showRekapForPeriod(activePeriod);
+            }
         }
 
         function exportTableToExcel() {
@@ -659,6 +692,7 @@
         });
 
         dom.exportBtn.addEventListener('click', exportTableToExcel);
+        dom.rekapTableWrapper.addEventListener('click', handleAttendanceToggle);
 
         // --- Initial Setup ---
         lucide.createIcons();
